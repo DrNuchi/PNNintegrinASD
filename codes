@@ -1,0 +1,493 @@
+## ---- Configuration ----------------------------------------------------------
+PROJ_ROOT  <- "."                      
+FASTA_PATH <- file.path(PROJ_ROOT, "Homo_sapiens.GRCh38.cdna.all.fa.gz")
+OUT        <- file.path(PROJ_ROOT, "results2")
+SEED       <- 20260828
+MIN_COUNT  <- 10                       
+MIN_SAMPLES<- 6                        
+SESOI      <- 0.8                       # smallest effect size of interest, |d|
+dir.create(OUT, showWarnings = FALSE, recursive = TRUE)
+set.seed(SEED)
+
+suppressPackageStartupMessages({
+  library(tidyverse); library(data.table); library(tximport); library(DESeq2)
+  library(ggrepel)
+})
+filter <- dplyr::filter; select <- dplyr::select; rename <- dplyr::rename
+
+PAL <- c(CTL = "#3B7EA1", ASD = "#C0392B")
+thm <- theme_bw(11) + theme(panel.grid.minor = element_blank(),
+                            plot.title = element_text(face = "bold"))
+sv  <- function(p, n, w, h) { ggsave(file.path(OUT, paste0(n, ".pdf")), p,
+                                     width = w, height = h)
+  ggsave(file.path(OUT, paste0(n, ".png")), p,
+         width = w, height = h, dpi = 400) }
+wr  <- function(d, n) fwrite(as.data.frame(d), file.path(OUT, paste0(n, ".csv")))
+strip_ver <- function(x) sub("\\.[0-9]+$", "", x)
+
+
+## =============================================================================
+## 1. GENE SETS
+## =============================================================================
+INTEGRIN_A <- c("ITGA1","ITGA2","ITGA3","ITGA4","ITGA5","ITGA6","ITGA7","ITGA8",
+                "ITGA9","ITGA10","ITGA11","ITGAV","ITGA2B","ITGAL","ITGAM",
+                "ITGAX","ITGAD","ITGAE")
+INTEGRIN_B <- paste0("ITGB", 1:8)
+INTEGRINS  <- c(INTEGRIN_A, INTEGRIN_B)
+
+## The 24 canonical alpha/beta receptor pairs (Humphries 2006; Hynes 2002;
+## Barczyk 2010) with their canonical ECM ligands.
+HD <- tibble::tribble(
+  ~dimer,  ~alpha,  ~beta,  ~ligands,
+  "a1b1",  "ITGA1", "ITGB1","COL4A1,COL4A2,COL1A1,LAMA1,LAMB1,LAMC1",
+  "a2b1",  "ITGA2", "ITGB1","COL1A1,COL1A2,COL3A1,LAMA1",
+  "a10b1", "ITGA10","ITGB1","COL2A1,COL9A1,COL11A1",
+  "a11b1", "ITGA11","ITGB1","COL1A1,COL1A2",
+  "a3b1",  "ITGA3", "ITGB1","LAMA3,LAMA5,LAMB3,LAMC2,RELN",
+  "a6b1",  "ITGA6", "ITGB1","LAMA1,LAMA2,LAMB1,LAMC1",
+  "a7b1",  "ITGA7", "ITGB1","LAMA1,LAMA2,LAMB1",
+  "a6b4",  "ITGA6", "ITGB4","LAMA3,LAMA5,LAMB3,LAMC2",
+  "a5b1",  "ITGA5", "ITGB1","FN1,FBN1",
+  "a8b1",  "ITGA8", "ITGB1","FN1,TNC,NPNT,VTN",
+  "aVb1",  "ITGAV", "ITGB1","VTN,FN1,LTBP1",
+  "aVb3",  "ITGAV", "ITGB3","VTN,FN1,TNC,SPP1,THBS1,EDIL3,POSTN,MFGE8",
+  "aVb5",  "ITGAV", "ITGB5","VTN,FN1,MFGE8",
+  "aVb6",  "ITGAV", "ITGB6","FN1,TNC,TGFB1,LTBP1",
+  "aVb8",  "ITGAV", "ITGB8","TGFB1,LTBP1,VTN",
+  "aIIbb3","ITGA2B","ITGB3","FGA,FGB,FGG,VWF,FN1",
+  "a4b1",  "ITGA4", "ITGB1","VCAM1,FN1",
+  "a4b7",  "ITGA4", "ITGB7","MADCAM1,VCAM1,FN1",
+  "a9b1",  "ITGA9", "ITGB1","TNC,SPP1,VCAM1,EDIL3",
+  "aEb7",  "ITGAE", "ITGB7","CDH1",
+  "aLb2",  "ITGAL", "ITGB2","ICAM1,ICAM2,ICAM3,ICAM5",
+  "aMb2",  "ITGAM", "ITGB2","C3,FGA,FGB,FGG,ICAM1",
+  "aXb2",  "ITGAX", "ITGB2","C3,FGB,ICAM1",
+  "aDb2",  "ITGAD", "ITGB2","ICAM3,VCAM1")
+
+PNN <- c("ACAN","BCAN","NCAN","VCAN","HAPLN1","HAPLN2","HAPLN3","HAPLN4","TNR",
+         "TNC","HAS1","HAS2","HAS3","CD44","PTPRZ1","CSPG4","CSPG5","NPTX2",
+         "SEMA3A","BGN","DCN","LUM")
+PROTEASES <- c(paste0("MMP", c(1:3,7:17,19,21,24,25,28)), "MMP23B",
+               paste0("TIMP", 1:4),
+               "ADAMTS1","ADAMTS4","ADAMTS5","ADAMTS8","ADAMTS9","ADAMTS15",
+               "ADAMTS20","ADAM10","ADAM17","ADAM22","ADAM23",
+               "CTSA","CTSB","CTSD","CTSF","CTSK","CTSL","CTSS","CTSZ",
+               "PLAU","PLAUR","PLAT","SERPINE1","SERPINE2")
+ADHESOME <- c("PTK2","PTK2B","SRC","FYN","TLN1","TLN2","VCL","PXN","ZYX","TNS1",
+              "ILK","PARVA","PARVB","RSU1","FERMT1","FERMT2","FERMT3","LIMS1",
+              "BCAR1","CRK","DOCK1","RAP1A","RAP1B","RHOA","ROCK1","ROCK2",
+              "ACTN1","ACTN4","CAPN2","FLNA","YAP1","WWTR1","TEAD1","CCN1",
+              "CCN2","PIEZO1","PIEZO2","TRPV4")
+RELN_AXIS <- c("RELN","VLDLR","LRP8","DAB1","CDK5","CDK5R1")
+
+## Cell-type markers for the composition adjustment. Deliberately excludes
+## integrins, MMPs and HLA genes so the adjustment is not circular with the
+## outcomes it is applied to.
+CELLTYPE <- list(
+  excitatory  = c("SLC17A7","SLC17A6","SATB2","NRGN","CAMK2A","RORB","CUX2","FEZF2"),
+  inhibitory  = c("GAD1","GAD2","SLC32A1","PVALB","SST","VIP","LHX6","ADARB2"),
+  astrocyte   = c("AQP4","GJA1","SLC1A2","SLC1A3","ALDH1L1","GFAP","GLUL","SLC4A4"),
+  microglia   = c("CSF1R","P2RY12","CX3CR1","TMEM119","C1QA","C1QB","C1QC","AIF1",
+                  "TYROBP","DOCK8","SPI1"),
+  oligodendro = c("PLP1","MBP","MOG","MOBP","CNP","MAG","CLDN11","ST18"))
+
+## Human matrisome (Naba et al.) via MatrisomeAnalyzeR.
+suppressPackageStartupMessages(library(MatrisomeAnalyzeR))
+ann <- matriannotate(data.frame(Gene.Symbol = AnnotationDbi::keys(
+  org.Hs.eg.db::org.Hs.eg.db, keytype = "SYMBOL")),
+  gene.column = "Gene.Symbol", species = "human")
+gcol <- grep("^annotated gene$", names(ann), ignore.case = TRUE, value = TRUE)
+kcol <- grep("categ", names(ann), ignore.case = TRUE, value = TRUE)[1]
+keep_m <- !grepl("non[- ]?matrisome", ann[[kcol]], ignore.case = TRUE)
+MATRISOME <- split(as.character(ann[[gcol]][keep_m]),
+                   as.character(ann[[kcol]][keep_m])) |> lapply(unique)
+MATRISOME_ALL <- unique(unlist(MATRISOME))
+COLLAGENS <- MATRISOME[[grep("collagen", names(MATRISOME), ignore.case = TRUE)[1]]]
+stopifnot(length(MATRISOME_ALL) > 500, "COL1A1" %in% MATRISOME_ALL,
+          !"ACTB" %in% MATRISOME_ALL)
+
+## Pre-specified test family for the gene-level analysis.
+INTEGRISOME <- unique(c(INTEGRINS, unlist(strsplit(HD$ligands, ",")),
+                        ADHESOME, PNN, PROTEASES, RELN_AXIS))
+
+
+## =============================================================================
+## 2. IMPORT
+## =============================================================================
+SAMPLES <- c(paste0("C", 1:6), paste0("A", 1:8))
+files   <- setNames(file.path(PROJ_ROOT, SAMPLES, "quant.sf"), SAMPLES)
+stopifnot(all(file.exists(files)))
+meta <- data.frame(sample_id = SAMPLES,
+                   condition = factor(ifelse(grepl("^C", SAMPLES), "CTL", "ASD"),
+                                      levels = c("CTL", "ASD")),
+                   row.names = SAMPLES)
+
+## tx2gene from the transcript FASTA that built the Salmon index. Its headers
+## carry gene id, symbol and biotype, so the map is complete by construction.
+hdr <- grep("^>", readLines(gzfile(FASTA_PATH, "rt")), value = TRUE)
+fld <- function(x, key) {                 # length-preserving field extractor
+  rx <- regexpr(paste0("(?:^|\\s)", key, ":\\S+"), x, perl = TRUE)
+  out <- rep(NA_character_, length(x)); ok <- rx > 0
+  out[ok] <- sub(paste0("^\\s*", key, ":"), "",
+                 substring(x[ok], rx[ok], rx[ok] + attr(rx,"match.length")[ok] - 1L))
+  out
+}
+t2g <- data.frame(TXNAME = strip_ver(sub("^>([^ ]+).*", "\\1", hdr)),
+                  GENEID = strip_ver(fld(hdr, "gene")),
+                  SYMBOL = fld(hdr, "gene_symbol"),
+                  BIOTYPE = fld(hdr, "gene_biotype")) |>
+  filter(!is.na(TXNAME), !duplicated(TXNAME))
+
+txi <- tximport(files, type = "salmon", tx2gene = t2g[, c("TXNAME","GENEID")],
+                ignoreTxVersion = TRUE)
+
+gm <- t2g[!duplicated(t2g$GENEID), c("GENEID","SYMBOL","BIOTYPE")]
+gene_map <- data.frame(
+  GENEID  = rownames(txi$counts),
+  SYMBOL  = gm$SYMBOL [match(rownames(txi$counts), gm$GENEID)],
+  BIOTYPE = gm$BIOTYPE[match(rownames(txi$counts), gm$GENEID)],
+  row.names = rownames(txi$counts))
+ns <- is.na(gene_map$SYMBOL) | gene_map$SYMBOL == ""
+gene_map$SYMBOL[ns] <- gene_map$GENEID[ns]
+
+
+ANCHORS <- c(ITGB1 = "ENSG00000150093", ITGAV = "ENSG00000138448",
+             ITGB2 = "ENSG00000160255", ITGA5 = "ENSG00000161638",
+             CD44  = "ENSG00000026508", GFAP  = "ENSG00000131095")
+stopifnot(all(gene_map$SYMBOL[match(ANCHORS, gene_map$GENEID)] == names(ANCHORS),
+              na.rm = TRUE))
+
+
+if (any(duplicated(gene_map$SYMBOL))) {
+  mu  <- rowMeans(txi$counts)[rownames(gene_map)]
+  ord <- order(gene_map$SYMBOL, -mu)
+  keep <- gene_map$GENEID %in% gene_map$GENEID[ord][!duplicated(gene_map$SYMBOL[ord])]
+  gene_map <- gene_map[keep, ]
+  txi <- lapply(txi, function(x) if (is.matrix(x)) x[keep, ] else x)
+}
+
+dds <- DESeqDataSetFromTximport(txi, colData = meta, design = ~ condition)
+SummarizedExperiment::rowData(dds) <- gene_map
+keep <- (is.na(gene_map$BIOTYPE) |
+           gene_map$BIOTYPE %in% c("protein_coding","lncRNA")) &
+  rowSums(counts(dds) >= MIN_COUNT) >= MIN_SAMPLES
+dds <- dds[keep, ]
+SYM <- SummarizedExperiment::rowData(dds)$SYMBOL
+
+
+## =============================================================================
+## 3. RNA DEGRADATION COVARIATE
+## =============================================================================
+deg <- purrr::map_dfr(SAMPLES, function(s) {
+  q <- fread(files[s], select = c("Length","NumReads"))[NumReads > 0]
+  tot <- sum(q$NumReads)
+  tibble(sample_id = s,
+         wt_len   = sum(q$Length * q$NumReads) / tot,
+         frac_4kb = sum(q$NumReads[q$Length > 4000]) / tot,
+         frac_1kb = sum(q$NumReads[q$Length < 1000]) / tot)
+})
+di <- prcomp(scale(deg[, c("wt_len","frac_4kb","frac_1kb")]))$x[, 1]
+if (cor(di, deg$wt_len) > 0) di <- -di
+deg$degradation_index <- as.numeric(scale(di))
+meta <- as.data.frame(left_join(meta, deg, by = "sample_id"))
+rownames(meta) <- meta$sample_id
+stopifnot(!any(is.na(meta$degradation_index)))
+wr(meta, "S1_sample_metadata_QC")
+
+SummarizedExperiment::colData(dds) <- S4Vectors::DataFrame(meta, row.names = SAMPLES)
+design(dds) <- ~ degradation_index + condition
+vsd <- vst(dds, blind = FALSE)
+E <- SummarizedExperiment::assay(vsd); rownames(E) <- SYM
+E <- E[!duplicated(rownames(E)) & rownames(E) != "", meta$sample_id]
+
+IDX_CTL <- which(meta$condition == "CTL"); N1 <- length(IDX_CTL)
+IDX_ASD <- which(meta$condition == "ASD"); N2 <- length(IDX_ASD)
+
+
+## =============================================================================
+## 4. EFFECT SIZES
+## =============================================================================
+dds  <- DESeq(dds, fitType = "parametric", quiet = TRUE)
+r0   <- results(dds, contrast = c("condition","ASD","CTL"))
+dfree <- N1 + N2 - 2
+J     <- 1 - 3/(4*dfree - 1)
+K     <- sqrt(1/N1 + 1/N2)
+
+est <- as.data.frame(r0) |> tibble::rownames_to_column("gene_id") |>
+  mutate(symbol = SYM[match(gene_id, rownames(dds))],
+         sd_within = lfcSE / K,
+         hedges_g  = (log2FoldChange / sd_within) * J,
+         se_g      = sqrt((N1+N2)/(N1*N2) + (hedges_g/J)^2/(2*(N1+N2))) * J,
+         g_lo = hedges_g - 1.96*se_g, g_hi = hedges_g + 1.96*se_g,
+         magnitude = case_when(abs(hedges_g) >= 1.2 ~ "very large",
+                               abs(hedges_g) >= 0.8 ~ "large",
+                               abs(hedges_g) >= 0.5 ~ "medium",
+                               TRUE                 ~ "small")) |>
+  filter(!is.na(hedges_g)) |> arrange(desc(abs(hedges_g)))
+wr(est |> filter(symbol %in% INTEGRISOME) |>
+     select(symbol, baseMean, log2FoldChange, hedges_g, g_lo, g_hi, magnitude, pvalue),
+   "S2_integrisome_effect_sizes_all_genes")
+
+## ---- Panel-level effect sizes (Finding 1) -----------------------------------
+panels <- list(Matrisome = MATRISOME_ALL, Collagens = COLLAGENS,
+               `ECM proteases` = PROTEASES, `Perineuronal net` = PNN,
+               Adhesome = ADHESOME, `Integrin subunits` = INTEGRINS,
+               `Integrin alpha` = INTEGRIN_A, `Integrin beta` = INTEGRIN_B)
+panel_est <- purrr::imap_dfr(panels, function(gs, nm) {
+  e <- est |> filter(symbol %in% gs)
+  if (nrow(e) < 5) return(NULL)
+  se <- sd(e$hedges_g)/sqrt(nrow(e))
+  tibble(panel = nm, n_genes = nrow(e), n_up = sum(e$hedges_g > 0),
+         mean_g = mean(e$hedges_g), lo = mean_g - 1.96*se, hi = mean_g + 1.96*se,
+         excludes_zero = lo > 0 | hi < 0,
+         n_large = sum(abs(e$hedges_g) >= SESOI))
+}) |> arrange(desc(mean_g))
+print(as.data.frame(panel_est)); wr(panel_est, "T1_panel_effect_sizes")
+
+## Panels are additionally compared with length-matched background genes,
+## because ECM transcripts are unusually long and the ASD libraries are
+## marginally more degraded.
+glen <- rowMeans(SummarizedExperiment::assays(dds)[["avgTxLength"]])
+est$len <- glen[match(est$gene_id, names(glen))]
+est$bin <- cut(est$len, quantile(est$len, seq(0,1,.1), na.rm = TRUE),
+               include.lowest = TRUE)
+bg <- est |> filter(!symbol %in% c(MATRISOME_ALL, INTEGRINS, PROTEASES, PNN))
+len_null <- purrr::imap_dfr(panels[c("Matrisome","Collagens","Integrin subunits")],
+                            function(gs, nm) {
+                              i <- which(est$symbol %in% gs); if (length(i) < 5) return(NULL)
+                              obs <- mean(est$hedges_g[i])
+                              nul <- replicate(2000, mean(vapply(est$bin[i], function(b) {
+                                p <- which(bg$bin == b)
+                                if (!length(p)) NA_real_ else bg$hedges_g[sample(p, 1)] }, numeric(1)),
+                                na.rm = TRUE))
+                              tibble(panel = nm, observed_mean_g = obs, null_mean_g = mean(nul),
+                                     p_vs_length_matched = (1 + sum(abs(nul) >= abs(obs)))/(1 + length(nul)))
+                            })
+print(as.data.frame(len_null)); wr(len_null, "S3_length_matched_background")
+
+## ---- FIGURE 1: panel effect sizes -------------------------------------------
+f1 <- ggplot(panel_est, aes(mean_g, reorder(panel, mean_g))) +
+  annotate("rect", xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = Inf, fill = "white") +
+  geom_vline(xintercept = 0, colour = "grey40") +
+  geom_pointrange(aes(xmin = lo, xmax = hi, colour = excludes_zero), fatten = 3) +
+  scale_colour_manual(values = c(`TRUE` = PAL[["ASD"]], `FALSE` = "grey55"),
+                      guide = "none") +
+  labs(x = "Mean Hedges g (95% CI), ASD vs control", y = NULL,
+       title = "The matrix shifts; the receptors do not",
+       subtitle = "Red = interval excludes zero") + thm
+sv(f1, "FIG1_panel_effect_sizes", 7, 4)
+
+## ---- FIGURE 2: large-effect genes -------------------------------------------
+top <- est |> filter(symbol %in% INTEGRISOME, abs(hedges_g) >= SESOI) |>
+  mutate(class = case_when(symbol %in% INTEGRINS  ~ "Integrin subunit",
+                           symbol %in% PROTEASES  ~ "ECM protease",
+                           symbol %in% PNN        ~ "Perineuronal net",
+                           symbol %in% ADHESOME   ~ "Adhesome",
+                           TRUE                   ~ "ECM ligand"))
+f2 <- ggplot(top, aes(hedges_g, reorder(symbol, hedges_g), colour = class)) +
+  annotate("rect", xmin = -SESOI, xmax = SESOI, ymin = -Inf, ymax = Inf,
+           fill = "grey93") +
+  geom_vline(xintercept = 0, colour = "grey40") +
+  geom_pointrange(aes(xmin = g_lo, xmax = g_hi), fatten = 2.5) +
+  labs(x = "Hedges g (95% CI)", y = NULL,
+       title = "Integrisome genes with large effects",
+       subtitle = paste0("Shaded band = |g| < ", SESOI,
+                         ". Interval width is set by n, not by biology.")) + thm
+sv(f2, "FIG2_large_effect_genes", 7.5, 5.5)
+wr(top |> select(symbol, class, baseMean, log2FoldChange, hedges_g, g_lo, g_hi, pvalue),
+   "T2_large_effect_genes")
+
+
+## =============================================================================
+## 5. ECM-INTEGRIN COUPLING
+##
+## Coupling is the transcriptional co-regulation of a gene pair across donors.
+## It is not evidence of heterodimer formation, which is post-translational.
+## =============================================================================
+## Degradation is removed before correlating; design = ~condition preserves the
+## group difference under test.
+E_adj <- limma::removeBatchEffect(
+  E, covariates = as.matrix(meta[, "degradation_index", drop = FALSE]),
+  design = model.matrix(~ condition, meta))
+
+cpm_m <- edgeR::cpm(counts(dds)); rownames(cpm_m) <- SYM
+cpm_m <- cpm_m[rownames(E_adj), , drop = FALSE]
+expressed <- rownames(cpm_m)[rowSums(cpm_m >= 1) >= N1]
+
+pairs_tbl <- bind_rows(
+  HD |> transmute(set = "alpha_beta", label = dimer, A = alpha, B = beta),
+  tidyr::expand_grid(A = c("ACAN","BCAN","NCAN","VCAN","TNR","HAPLN1"),
+                     B = c("ITGB1","ITGB3","ITGAV","ITGA5","CD44","PTPRZ1")) |>
+    transmute(set = "pnn_receptor", label = paste0(A, ":", B), A, B)) |>
+  filter(A %in% expressed, B %in% expressed, A != B)
+
+## Per-donor coupling score: the mean cross-product of the two partners'
+## within-cohort z-scores. Unlike a correlation this is defined per subject, so
+## it can be given an effect size and adjusted for composition.
+score_of <- function(M, pp) { Z <- t(scale(t(M)))
+colMeans(Z[pp$A, ] * Z[pp$B, ], na.rm = TRUE) }
+
+g_boot <- function(v, B = 5000) {
+  a <- v[IDX_ASD]; b <- v[IDX_CTL]
+  pooled_sd <- function(x, y)
+    sqrt(((length(x)-1)*var(x) + (length(y)-1)*var(y))/(length(x)+length(y)-2))
+  g <- (mean(a) - mean(b)) / pooled_sd(a, b) * J
+  ## NOTE: sample(x, TRUE) passes TRUE as the SIZE argument, not replace, and
+  ## errors. The size must be given explicitly for a case resampling bootstrap.
+  bs <- replicate(B, {
+    ai <- sample(a, length(a), replace = TRUE)
+    bi <- sample(b, length(b), replace = TRUE)
+    s  <- pooled_sd(ai, bi)
+    if (!is.finite(s) || s == 0) NA_real_ else (mean(ai) - mean(bi)) / s * J
+  })
+  if (all(is.na(bs))) return(c(g = g, lo = NA_real_, hi = NA_real_))
+  c(g = g, lo = unname(quantile(bs, .025, na.rm = TRUE)),
+    hi = unname(quantile(bs, .975, na.rm = TRUE)))
+}
+
+## ---- Composition adjustment (cell-type marker scores) -----------------------
+Zc <- t(scale(t(E)))
+ct <- as.data.frame(vapply(CELLTYPE, function(g) {
+  g <- intersect(g, rownames(Zc)); colMeans(Zc[g, , drop = FALSE], na.rm = TRUE)
+}, numeric(ncol(E))))
+meta <- cbind(meta, ct[match(meta$sample_id, rownames(ct)), ])
+E_comp <- limma::removeBatchEffect(
+  E_adj, covariates = as.matrix(meta[, names(CELLTYPE)]),
+  design = model.matrix(~ condition, meta))
+
+coupling <- purrr::map_dfr(split(pairs_tbl, pairs_tbl$set), function(pp) {
+  v0 <- score_of(E_adj, pp); v1 <- score_of(E_comp, pp)
+  a <- g_boot(v0); b <- g_boot(v1)
+  tibble(set = unique(pp$set), n_pairs = nrow(pp),
+         mean_CTL = mean(v0[IDX_CTL]), mean_ASD = mean(v0[IDX_ASD]),
+         g = a["g"], g_lo = a["lo"], g_hi = a["hi"],
+         g_compadj = b["g"], g_compadj_lo = b["lo"], g_compadj_hi = b["hi"])
+})
+print(as.data.frame(coupling)); wr(coupling, "T3_coupling_effect_sizes")
+
+## Cell-type differences, reported so the composition adjustment is interpretable
+ct_est <- purrr::map_dfr(names(CELLTYPE), function(k) {
+  r <- g_boot(meta[[k]]); tibble(cell_type = k, g = r["g"], lo = r["lo"], hi = r["hi"])
+})
+print(as.data.frame(ct_est)); wr(ct_est, "S4_celltype_effect_sizes")
+
+## ---- FIGURE 3: coupling, per donor and after composition adjustment ---------
+sc_long <- purrr::map_dfr(split(pairs_tbl, pairs_tbl$set), function(pp)
+  tibble(set = unique(pp$set), sample_id = colnames(E_adj),
+         condition = meta$condition,
+         Unadjusted = score_of(E_adj, pp),
+         `Composition-adjusted` = score_of(E_comp, pp))) |>
+  tidyr::pivot_longer(c(Unadjusted, `Composition-adjusted`),
+                      names_to = "adjustment", values_to = "score") |>
+  mutate(set = recode(set, alpha_beta = "Integrin alpha/beta pairs",
+                      pnn_receptor = "PNN-integrin receptor pairs"),
+         adjustment = factor(adjustment,
+                             levels = c("Unadjusted","Composition-adjusted")))
+f3 <- ggplot(sc_long, aes(condition, score, colour = condition)) +
+  geom_boxplot(outlier.shape = NA, width = .55) +
+  ggbeeswarm::geom_quasirandom(width = .15, size = 2) +
+  facet_grid(adjustment ~ set) +
+  scale_colour_manual(values = PAL, guide = "none") +
+  labs(x = NULL, y = "Per-donor coupling score",
+       title = "Perineuronal-net coupling is lost in ASD and survives adjustment",
+       subtitle = "Integrin alpha/beta coupling is unchanged in both panels") + thm
+sv(f3, "FIG3_coupling", 8, 6)
+
+writeLines(capture.output(sessionInfo()), file.path(OUT, "sessionInfo.txt"))
+message("\nDone. Figures and tables in ", normalizePath(OUT))
+
+
+## #############################################################################
+##  Supplementary robustness checks
+## #############################################################################
+
+OUTS <- file.path(OUT, "supplementary"); dir.create(OUTS, showWarnings = FALSE)
+wrs  <- function(d, n) fwrite(as.data.frame(d), file.path(OUTS, paste0(n, ".csv")))
+
+## ---- S5. Replication of Babu et al.2026 -----------------------------------------
+anchors <- c("MMP2","MMP9","MMP16","HLA-DRB1")
+rep_tbl <- est |> filter(symbol %in% anchors) |>
+  select(symbol, baseMean, log2FoldChange, hedges_g, g_lo, g_hi, pvalue)
+missing <- setdiff(anchors, est$symbol)
+if (length(missing)) {
+  lib <- colSums(txi$counts)
+  low <- purrr::map_dfr(missing, function(g) {
+    ids <- intersect(gene_map$GENEID[gene_map$SYMBOL == g], rownames(txi$counts))
+    if (!length(ids)) return(NULL)
+    cnt <- colSums(txi$counts[ids, , drop = FALSE])[meta$sample_id]
+    cpm <- cnt / lib[meta$sample_id] * 1e6
+    tibble(gene = g, n_detected_CTL = sum(cnt[IDX_CTL] > 0),
+           n_detected_ASD = sum(cnt[IDX_ASD] > 0),
+           mean_CPM_CTL = mean(cpm[IDX_CTL]), mean_CPM_ASD = mean(cpm[IDX_ASD]),
+           fold = mean(cpm[IDX_ASD]) / pmax(mean(cpm[IDX_CTL]), 1e-9))
+  })
+  print(as.data.frame(low)); wrs(low, "S5b_below_expression_floor")
+}
+print(as.data.frame(rep_tbl)); wrs(rep_tbl, "S5_replication_parent_study")
+
+## ---- S6. Precision and exaggeration ------------------------------------------
+prec <- tibble(median_CI_width_g = median(est$g_hi - est$g_lo, na.rm = TRUE),
+               n_CTL = N1, n_ASD = N2)
+se_g0 <- function(d) sqrt((N1+N2)/(N1*N2) + d^2/(2*(N1+N2))) * J
+set.seed(SEED)
+retro <- purrr::map_dfr(c(0.2,0.3,0.5,0.8,1.0,1.2), function(td) {
+  s <- se_g0(td)/J; crit <- qt(.975, dfree)*s
+  e <- rnorm(2e5, td, s); sig <- abs(e) > crit
+  tibble(assumed_true_d = td, power = mean(sig),
+         type_S = mean(sign(e[sig]) != sign(td)),
+         exaggeration_type_M = mean(abs(e[sig]))/abs(td))
+})
+print(as.data.frame(prec)); print(as.data.frame(retro))
+wrs(prec, "S6a_precision"); wrs(retro, "S6b_type_M_S")
+
+## ---- S7. Directional coherence within panels ---------------------------------
+sign_tbl <- purrr::imap_dfr(panels, function(gs, nm) {
+  e <- est |> filter(symbol %in% gs); if (nrow(e) < 5) return(NULL)
+  tibble(panel = nm, n = nrow(e), n_up = sum(e$hedges_g > 0),
+         p_sign = binom.test(sum(e$hedges_g > 0), nrow(e))$p.value)
+})
+print(as.data.frame(sign_tbl)); wrs(sign_tbl, "S7_panel_sign_tests")
+
+## ---- S8. Beta-2 integrins are microglial abundance readouts ------------------
+b2 <- intersect(c("ITGAM","ITGAX","ITGAL","ITGAD","ITGB2"), rownames(E))
+circ <- tibble(gene = b2,
+               rho_microglia = vapply(b2, function(g)
+                 cor(E[g, ], meta$microglia, method = "spearman"), numeric(1)),
+               var_explained = vapply(b2, function(g)
+                 summary(lm(E[g, ] ~ meta$microglia))$r.squared, numeric(1)))
+print(as.data.frame(circ)); wrs(circ, "S8_beta2_circularity")
+
+## ---- S9. Leave-one-donor-out stability of the coupling result ----------------
+loo <- purrr::map_dfr(split(pairs_tbl, pairs_tbl$set), function(pp) {
+  purrr::map_dfr(seq_len(nrow(meta)), function(i) {
+    k <- setdiff(seq_len(nrow(meta)), i); g <- meta$condition[k]
+    if (min(table(g)) < 4) return(NULL)
+    v <- score_of(E_adj[, k], pp); a <- v[g == "ASD"]; b <- v[g == "CTL"]
+    sp <- sqrt(((length(a)-1)*var(a) + (length(b)-1)*var(b))/(length(a)+length(b)-2))
+    tibble(set = unique(pp$set), dropped = meta$sample_id[i],
+           g = (mean(a) - mean(b))/sp * J)
+  })
+})
+loo_sum <- loo |> group_by(set) |>
+  summarise(min_g = min(g), max_g = max(g), median_g = median(g),
+            n_runs_large = sum(abs(g) >= SESOI), n_runs = n())
+print(as.data.frame(loo_sum)); wrs(loo, "S9_leave_one_out"); wrs(loo_sum, "S9_leave_one_out_summary")
+
+## ---- S10. Permutation tests (secondary) ---------------------------------------
+## Exact: choose(14,6) = 3003 assignments, so every possible split is enumerated.
+ALL_SPLITS <- combn(nrow(meta), N1, simplify = FALSE)
+perm_p <- function(v) {
+  obs <- mean(v[IDX_CTL]) - mean(v[IDX_ASD])
+  nul <- vapply(ALL_SPLITS, function(s) mean(v[s]) - mean(v[-s]), numeric(1))
+  (1 + sum(abs(nul) >= abs(obs)))/(1 + length(nul))
+}
+perm_tbl <- purrr::map_dfr(split(pairs_tbl, pairs_tbl$set), function(pp)
+  tibble(set = unique(pp$set),
+         p_unadjusted = perm_p(score_of(E_adj, pp)),
+         p_composition_adjusted = perm_p(score_of(E_comp, pp))))
+ct_perm <- purrr::map_dfr(names(CELLTYPE), function(k)
+  tibble(cell_type = k, p_exact_perm = perm_p(meta[[k]])))
+print(as.data.frame(perm_tbl)); print(as.data.frame(ct_perm))
+wrs(perm_tbl, "S10a_coupling_permutation"); wrs(ct_perm, "S10b_celltype_permutation")
+
+message("\nSupplementary checks written to ", normalizePath(OUTS))
