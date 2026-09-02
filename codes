@@ -1,12 +1,14 @@
 ## ---- Configuration ----------------------------------------------------------
-PROJ_ROOT  <- "."                      
+PROJ_ROOT  <- "."                       # folder holding C1..C6 and A1..A8
 FASTA_PATH <- file.path(PROJ_ROOT, "Homo_sapiens.GRCh38.cdna.all.fa.gz")
 OUT        <- file.path(PROJ_ROOT, "results2")
 SEED       <- 20260828
-MIN_COUNT  <- 10                       
-MIN_SAMPLES<- 6                        
+MIN_COUNT  <- 10                        # >= MIN_COUNT reads in ...
+MIN_SAMPLES<- 6                         # ... >= MIN_SAMPLES samples
 SESOI      <- 0.8                       # smallest effect size of interest, |d|
 dir.create(OUT, showWarnings = FALSE, recursive = TRUE)
+
+invisible(file.remove(list.files(OUT, pattern = "^T_S[0-9]", full.names = TRUE)))
 set.seed(SEED)
 
 suppressPackageStartupMessages({
@@ -22,7 +24,21 @@ sv  <- function(p, n, w, h) { ggsave(file.path(OUT, paste0(n, ".pdf")), p,
                                      width = w, height = h)
   ggsave(file.path(OUT, paste0(n, ".png")), p,
          width = w, height = h, dpi = 400) }
-wr  <- function(d, n) fwrite(as.data.frame(d), file.path(OUT, paste0(n, ".csv")))
+
+tidy_ci <- function(d) {
+  d  <- as.data.frame(d)
+  nm <- names(d)
+  
+  nm <- sub("^null_lo$", "null_percentile_2.5",  nm)
+  nm <- sub("^null_hi$", "null_percentile_97.5", nm)
+  nm <- sub("^lo$",   "CI95_lower", nm)
+  nm <- sub("^hi$",   "CI95_upper", nm)
+  nm <- sub("_lo$",   "_CI95_lower", nm)
+  nm <- sub("_hi$",   "_CI95_upper", nm)
+  names(d) <- nm
+  d
+}
+wr  <- function(d, n) fwrite(tidy_ci(d), file.path(OUT, paste0(n, ".csv")))
 strip_ver <- function(x) sub("\\.[0-9]+$", "", x)
 
 
@@ -35,8 +51,7 @@ INTEGRIN_A <- c("ITGA1","ITGA2","ITGA3","ITGA4","ITGA5","ITGA6","ITGA7","ITGA8",
 INTEGRIN_B <- paste0("ITGB", 1:8)
 INTEGRINS  <- c(INTEGRIN_A, INTEGRIN_B)
 
-## The 24 canonical alpha/beta receptor pairs (Humphries 2006; Hynes 2002;
-## Barczyk 2010) with their canonical ECM ligands.
+## The 24 canonical alpha/beta receptor pairs with their canonical ECM ligands.
 HD <- tibble::tribble(
   ~dimer,  ~alpha,  ~beta,  ~ligands,
   "a1b1",  "ITGA1", "ITGB1","COL4A1,COL4A2,COL1A1,LAMA1,LAMB1,LAMC1",
@@ -150,14 +165,15 @@ gene_map <- data.frame(
 ns <- is.na(gene_map$SYMBOL) | gene_map$SYMBOL == ""
 gene_map$SYMBOL[ns] <- gene_map$GENEID[ns]
 
-
 ANCHORS <- c(ITGB1 = "ENSG00000150093", ITGAV = "ENSG00000138448",
              ITGB2 = "ENSG00000160255", ITGA5 = "ENSG00000161638",
              CD44  = "ENSG00000026508", GFAP  = "ENSG00000131095")
 stopifnot(all(gene_map$SYMBOL[match(ANCHORS, gene_map$GENEID)] == names(ANCHORS),
               na.rm = TRUE))
 
-
+## One Ensembl id per symbol, keeping the highest-expressed copy: downstream the
+## analysis is indexed by symbol, and keeping an arbitrary copy can substitute a
+## near-zero locus for the real gene.
 if (any(duplicated(gene_map$SYMBOL))) {
   mu  <- rowMeans(txi$counts)[rownames(gene_map)]
   ord <- order(gene_map$SYMBOL, -mu)
@@ -177,6 +193,10 @@ SYM <- SummarizedExperiment::rowData(dds)$SYMBOL
 
 ## =============================================================================
 ## 3. RNA DEGRADATION COVARIATE
+##
+## RIN could not be joined to individual libraries, so degradation is measured
+## from the quantifications themselves: degraded RNA loses long transcripts
+## first, so the read-weighted mean transcript length falls.
 ## =============================================================================
 deg <- purrr::map_dfr(SAMPLES, function(s) {
   q <- fread(files[s], select = c("Length","NumReads"))[NumReads > 0]
@@ -206,6 +226,9 @@ IDX_ASD <- which(meta$condition == "ASD"); N2 <- length(IDX_ASD)
 
 ## =============================================================================
 ## 4. EFFECT SIZES
+##
+## Hedges g (Cohen's d with the small-sample correction) with 95% intervals.
+## p-values are retained as a secondary column only.
 ## =============================================================================
 dds  <- DESeq(dds, fitType = "parametric", quiet = TRUE)
 r0   <- results(dds, contrast = c("condition","ASD","CTL"))
@@ -260,7 +283,13 @@ len_null <- purrr::imap_dfr(panels[c("Matrisome","Collagens","Integrin subunits"
                                 p <- which(bg$bin == b)
                                 if (!length(p)) NA_real_ else bg$hedges_g[sample(p, 1)] }, numeric(1)),
                                 na.rm = TRUE))
-                              tibble(panel = nm, observed_mean_g = obs, null_mean_g = mean(nul),
+                              pe <- panel_est[panel_est$panel == nm, ]
+                              tibble(panel = nm, n_genes = length(i),
+                                     observed_mean_g = obs,
+                                     observed_lo = if (nrow(pe)) pe$lo else NA_real_,
+                                     observed_hi = if (nrow(pe)) pe$hi else NA_real_,
+                                     null_mean_g = mean(nul),
+                                     null_lo = quantile(nul, .025), null_hi = quantile(nul, .975),
                                      p_vs_length_matched = (1 + sum(abs(nul) >= abs(obs)))/(1 + length(nul)))
                             })
 print(as.data.frame(len_null)); wr(len_null, "S3_length_matched_background")
@@ -302,7 +331,7 @@ wr(top |> select(symbol, class, baseMean, log2FoldChange, hedges_g, g_lo, g_hi, 
 ## 5. ECM-INTEGRIN COUPLING
 ##
 ## Coupling is the transcriptional co-regulation of a gene pair across donors.
-## It is not evidence of heterodimer formation, which is post-translational.
+## It is not evidence of heterodimer formation.
 ## =============================================================================
 ## Degradation is removed before correlating; design = ~condition preserves the
 ## group difference under test.
@@ -397,14 +426,10 @@ writeLines(capture.output(sessionInfo()), file.path(OUT, "sessionInfo.txt"))
 message("\nDone. Figures and tables in ", normalizePath(OUT))
 
 
-## #############################################################################
-##  Supplementary robustness checks
-## #############################################################################
-
 OUTS <- file.path(OUT, "supplementary"); dir.create(OUTS, showWarnings = FALSE)
-wrs  <- function(d, n) fwrite(as.data.frame(d), file.path(OUTS, paste0(n, ".csv")))
+wrs  <- function(d, n) fwrite(tidy_ci(d), file.path(OUTS, paste0(n, ".csv")))
 
-## ---- S5. Replication of Babu et al.2026 -----------------------------------------
+## ---- S5. Replication of Babu et al. 2026 -----------------------------------------
 anchors <- c("MMP2","MMP9","MMP16","HLA-DRB1")
 rep_tbl <- est |> filter(symbol %in% anchors) |>
   select(symbol, baseMean, log2FoldChange, hedges_g, g_lo, g_hi, pvalue)
@@ -443,7 +468,13 @@ wrs(prec, "S6a_precision"); wrs(retro, "S6b_type_M_S")
 ## ---- S7. Directional coherence within panels ---------------------------------
 sign_tbl <- purrr::imap_dfr(panels, function(gs, nm) {
   e <- est |> filter(symbol %in% gs); if (nrow(e) < 5) return(NULL)
-  tibble(panel = nm, n = nrow(e), n_up = sum(e$hedges_g > 0),
+  se <- sd(e$hedges_g)/sqrt(nrow(e))
+  tibble(panel = nm, n_genes = nrow(e),
+         n_up = sum(e$hedges_g > 0), n_down = sum(e$hedges_g <= 0),
+         mean_g = mean(e$hedges_g),
+         mean_g_lo = mean(e$hedges_g) - 1.96*se,
+         mean_g_hi = mean(e$hedges_g) + 1.96*se,
+         n_large_effect = sum(abs(e$hedges_g) >= SESOI),
          p_sign = binom.test(sum(e$hedges_g > 0), nrow(e))$p.value)
 })
 print(as.data.frame(sign_tbl)); wrs(sign_tbl, "S7_panel_sign_tests")
@@ -472,6 +503,39 @@ loo_sum <- loo |> group_by(set) |>
   summarise(min_g = min(g), max_g = max(g), median_g = median(g),
             n_runs_large = sum(abs(g) >= SESOI), n_runs = n())
 print(as.data.frame(loo_sum)); wrs(loo, "S9_leave_one_out"); wrs(loo_sum, "S9_leave_one_out_summary")
+
+## ---- S11. Per-pair correlations underlying the coupling scores ---------------
+se_dz <- sqrt(1/(N1 - 3) + 1/(N2 - 3))
+fz    <- function(r) 0.5 * log((1 + r) / (1 - r))
+clamp <- function(r, eps = 1e-6) pmin(pmax(r, -1 + eps), 1 - eps)
+safe_cor <- function(x, y) {
+  if (sd(x) == 0 || sd(y) == 0 || !is.finite(sd(x)) || !is.finite(sd(y)))
+    return(NA_real_)
+  suppressWarnings(cor(x, y, method = "spearman"))
+}
+per_pair <- purrr::pmap_dfr(
+  list(pairs_tbl$set, pairs_tbl$label, pairs_tbl$A, pairs_tbl$B),
+  function(s, lab, a, b) {
+    r1 <- safe_cor(E_adj[a, IDX_CTL], E_adj[b, IDX_CTL])
+    r2 <- safe_cor(E_adj[a, IDX_ASD], E_adj[b, IDX_ASD])
+    dz <- fz(clamp(r2)) - fz(clamp(r1))
+    tibble(set = s, pair = lab, gene_A = a, gene_B = b,
+           rho_CTL = r1, rho_ASD = r2, delta_rho = r2 - r1,
+           delta_z = dz, delta_z_lo = dz - 1.96*se_dz, delta_z_hi = dz + 1.96*se_dz,
+           sign_reversal = !is.na(r1) & !is.na(r2) & sign(r1) != sign(r2) &
+             abs(r1) > 0.3 & abs(r2) > 0.3)
+  }) |> arrange(delta_z)
+print(as.data.frame(head(per_pair, 12))); wrs(per_pair, "S11_coupling_per_pair")
+message(sprintf("S11: %d of %d pairs reverse sign between groups",
+                sum(per_pair$sign_reversal, na.rm = TRUE), nrow(per_pair)))
+
+## ---- S12. Per-donor coupling scores ------------------------------------------
+per_donor <- purrr::map_dfr(split(pairs_tbl, pairs_tbl$set), function(pp)
+  tibble(set = unique(pp$set), sample_id = colnames(E_adj),
+         condition = as.character(meta$condition),
+         score_unadjusted = score_of(E_adj, pp),
+         score_composition_adjusted = score_of(E_comp, pp)))
+wrs(per_donor, "S12_coupling_per_donor_scores")
 
 ## ---- S10. Permutation tests (secondary) ---------------------------------------
 ## Exact: choose(14,6) = 3003 assignments, so every possible split is enumerated.
