@@ -193,10 +193,14 @@ SYM <- SummarizedExperiment::rowData(dds)$SYMBOL
 
 ## =============================================================================
 ## 3. RNA DEGRADATION COVARIATE
+## RIN joins to the libraries by NeuroBioBank subject id but is uncorrelated with
+## degradation in them (rho = -0.08; the RIN 2.4 donor ranks 12/14), because it
+## is measured on total RNA before poly-A selection. Degradation is measured
+## from the quantifications themselves instead: degraded RNA loses long
+## transcripts first, so the read-weighted mean transcript length falls.
 ##
-## RIN could not be joined to individual libraries, so degradation is measured
-## from the quantifications themselves: degraded RNA loses long transcripts
-## first, so the read-weighted mean transcript length falls.
+## Age, RIN and PMI are balanced between groups (Wilcoxon p >= 0.56), so they are
+## reported, not modelled - at 14 libraries each extra term costs a residual df.
 ## =============================================================================
 deg <- purrr::map_dfr(SAMPLES, function(s) {
   q <- fread(files[s], select = c("Length","NumReads"))[NumReads > 0]
